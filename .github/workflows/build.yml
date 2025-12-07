@@ -1,47 +1,43 @@
-name: Build
+name: Build and Release
 
 on:
   push:
     branches:
       - main
       - master
+    tags:
+      - 'v*'
   pull_request:
     branches:
       - main
       - master
+  workflow_dispatch:
 
 jobs:
-  build-windows:
-    runs-on: windows-latest
-    
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.23'
-
-      - name: Initialize Go module
-        run: |
-          go mod init ech-workers || true
-          go mod tidy
-
-      - name: Build Go executable
-        run: |
-          $env:GOOS="windows"; $env:GOARCH="amd64"; go build -o ech-workers.exe ech-workers.go
-
-      - name: Test executable
-        run: |
-          .\ech-workers.exe -h
-
-  build-macos:
+  build:
     strategy:
       matrix:
-        arch: [amd64, arm64]
-    
-    runs-on: macos-latest
+        include:
+          - os: windows-latest
+            goos: windows
+            goarch: amd64
+            exe_ext: .exe
+            archive_format: zip
+            archive_ext: .zip
+          - os: macos-latest
+            goos: darwin
+            goarch: amd64
+            exe_ext: ''
+            archive_format: zip
+            archive_ext: .zip
+          - os: macos-latest
+            goos: darwin
+            goarch: arm64
+            exe_ext: ''
+            archive_format: zip
+            archive_ext: .zip
+
+    runs-on: ${{ matrix.os }}
     
     steps:
       - name: Checkout code
@@ -59,11 +55,87 @@ jobs:
 
       - name: Build Go executable
         run: |
-          GOOS=darwin GOARCH=${{ matrix.arch }} go build -o ech-workers ech-workers.go
+          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -o ech-workers${{ matrix.exe_ext }} ech-workers.go
+        shell: bash
 
       - name: Test executable
         run: |
-          ./ech-workers -h
+          if [ "${{ matrix.goos }}" == "windows" ]; then
+            .\ech-workers.exe -h
+          else
+            ./ech-workers -h
+          fi
+        shell: bash
+
+      - name: Prepare release files
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          mkdir -p release
+          
+          # 复制 Go 可执行文件
+          cp ech-workers${{ matrix.exe_ext }} release/
+          
+          # 复制 Python 文件
+          cp gui.py release/
+          cp requirements.txt release/
+          
+          # 创建运行脚本
+          if [ "${{ matrix.goos }}" == "windows" ]; then
+            echo "@echo off" > release/run.bat
+            echo "python gui.py" >> release/run.bat
+            echo "if errorlevel 1 (" >> release/run.bat
+            echo "  echo Please install PyQt5: pip install PyQt5" >> release/run.bat
+            echo "  pause" >> release/run.bat
+            echo ")" >> release/run.bat
+          else
+            echo "#!/bin/bash" > release/run.sh
+            echo "python3 gui.py" >> release/run.sh
+            chmod +x release/run.sh
+          fi
+          
+          # 创建 README
+          cat > release/README.txt << 'EOF'
+ECH Workers Client
+
+Files:
+- ech-workers(.exe): Go compiled core proxy program
+- gui.py: Python GUI client
+- requirements.txt: Python dependencies
+- run.sh / run.bat: Launch script
+
+Usage:
+1. Install Python 3.6+ (if not already installed)
+2. Install dependencies: pip install PyQt5
+3. Run: python gui.py
+   Or use launch script: ./run.sh (Mac) or run.bat (Windows)
+
+System Requirements:
+- Windows: Windows 10+
+- macOS: macOS 10.13+
+- Python: 3.6+
+EOF
+        shell: bash
+
+      - name: Create archive (Windows)
+        if: startsWith(github.ref, 'refs/tags/') && matrix.goos == 'windows'
+        run: |
+          cd release
+          powershell Compress-Archive -Path * -DestinationPath ../ECHWorkers-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.archive_ext }} -Force
+        shell: powershell
+
+      - name: Create archive (macOS/Linux)
+        if: startsWith(github.ref, 'refs/tags/') && matrix.goos != 'windows'
+        run: |
+          cd release
+          zip -r ../ECHWorkers-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.archive_ext }} .
+        shell: bash
+
+      - name: Upload artifacts
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@v4
+        with:
+          name: ECHWorkers-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: ECHWorkers-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.archive_ext }}
 
   test-python:
     strategy:
@@ -91,3 +163,23 @@ jobs:
         run: |
           pip install PyQt5 || echo "PyQt5 installation skipped"
 
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            artifacts/**/*.zip
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
